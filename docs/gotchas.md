@@ -2466,3 +2466,36 @@ what such requests ask for, and the text improves as a conversation goes on. The
 map (`DSV41_PRUNE_SWAP=0`, decode adaptation off), so there it never heals and stays visible in
 every run -- which makes the prompt a useful canary for residency or ranking changes. Throughput
 gates do not notice (acceptance is fine); read the text.
+
+## Ranking residency by top-p share does not beat the raw router score (2026-10-11)
+
+With `DSV41_EXPERT_TOPP=0.90` dropping the low-share picks in decode, the question was whether the
+demand database should stop paying for them: today `DSV41_PRUNE_METRIC=score` adds each unpruned
+top-6 pick's raw router score, so a pick carrying 3% of a token's weight votes nearly as much as one
+carrying 40%. `tools/bench_rank_metric_tp.py` on the EXL3 all-weight profile (every expert resident,
+so any resident set is emulated by the router mask alone): demand recorded over both trace corpora
+(152 documents, 26K tokens, one request-unit vote each), one resident set per metric at FP4's
+9,793-expert budget via `global_residency.initial_selection`, held-out NLL
+(`corpus/heldout_eval.jsonl`) with decode's top-p 0.90 on every position. Paired against `score`:
+
+| metric (per pick) | experts differing | miss rate | share missed | coding | general |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| all resident (floor) | -- | 0 | 0 | 1.5336 (-0.006) | 1.9669 (-0.234) |
+| **score** (raw score; serving) | 0 | 13.1% | 11.1% | 1.5394 | 2.2009 |
+| frequency (1) | 438 | 13.1% | 11.8% | +0.0172 +- 0.0036 | +0.0344 +- 0.0065 |
+| kept (1 if top-p keeps it) | 326 | 13.1% | 11.5% | +0.0121 +- 0.0033 | +0.0329 +- 0.0076 |
+| share (w / sum w) | 168 | 13.2% | 11.3% | +0.0010 +- 0.0027 | +0.0116 +- 0.0037 |
+| share_kept (share if kept) | 202 | 13.2% | 11.2% | -0.0029 +- 0.0024 | +0.0025 +- 0.0039 |
+
+Without top-p in scoring (what a prefill computes), share_kept vs score is -0.0017 +- 0.0022 /
++0.0009 +- 0.0041. The reference arm re-scored bit-identically at the end.
+
+Read: weighting is what matters -- the two count metrics lose 0.012-0.034 nats at the same miss
+rate. Dropping the picks top-p discards helps a little within a family (share_kept vs share, kept
+vs frequency), but normalizing each token to one vote hurts (share vs score, 3 SE on general): the
+raw score's magnitude is itself information, since a token the router is sure about outvotes one it
+is not. share_kept only gets back to a tie with score, which does not pay for a new metric and a
+fresh database. Untested: raw score restricted to the kept picks (`score_kept`), which keeps both
+effects. The residency cost itself dwarfs every metric difference on general text (+0.234 for the
+best set vs +0.006 on code): 26K tokens of mostly English/code training demand leave whole topics
+unranked, which is the gap serving's adaptation exists to close.

@@ -8,6 +8,9 @@ gate_log_dir=${GATE_LOG_DIR:?set GATE_LOG_DIR}
 gate_script=${1:?script inside /app/tools}
 gate_host_script=${GATE_HOST_SCRIPT:-0}
 gate_source_root=${GATE_SOURCE_ROOT:-}
+# Per-container wall-clock cap; a multi-arm quality run needs more than a smoke gate.
+gate_timeout=${GATE_TIMEOUT:-900s}
+[[ "$gate_timeout" =~ ^[0-9]+[smh]?$ ]] || { echo "GATE_TIMEOUT: bad value '$gate_timeout'" >&2; exit 1; }
 shift
 set -a
 source .env
@@ -68,11 +71,11 @@ if [[ "$gate_host_script" == 1 ]]; then
 fi
 mkdir -p "$gate_log_dir"
 printf -v peer_cmd '%q ' docker run --name deepseek-tp-prefix-gate-rank1 "${flags[@]}" -e RANK=1 \
-    --entrypoint timeout "$gate_image" 900s python "$gate_entry" "$@"
+    --entrypoint timeout "$gate_image" "$gate_timeout" python "$gate_entry" "$@"
 ssh -o BatchMode=yes "$PEER" "$peer_cmd" > "$gate_log_dir/rank1.log" 2>&1 &
 peer_pid=$!
 docker run --name deepseek-tp-prefix-gate-rank0 "${flags[@]}" -e RANK=0 \
-    --entrypoint timeout "$gate_image" 900s python "$gate_entry" "$@" \
+    --entrypoint timeout "$gate_image" "$gate_timeout" python "$gate_entry" "$@" \
     > "$gate_log_dir/rank0.log" 2>&1 &
 head_pid=$!
 cleanup() {
