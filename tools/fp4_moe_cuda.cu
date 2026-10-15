@@ -694,6 +694,53 @@ __global__ void route_small_bm16(const int32_t *slots, int32_t *block_slot,
     }
 }
 
+// Batched multi-request decode stacks several verify blocks: 4 lanes x 6 rows x top-6 is 144
+// pairs, past route_small_bm16's 64-entry insertion sort. Same contract, same output: a stable
+// sort of the pairs by slot (unique, so it is exactly the insertion sort's order) and then the same
+// sequential block cut. The rank is computed in parallel -- each thread counts the pairs that sort
+// ahead of its own, O(P) per thread -- and only the O(P) cut runs on one thread.
+constexpr int kRouteWideMax = 512;
+
+__global__ void route_wide_bm16(const int32_t *slots, int32_t *block_slot,
+                                int32_t *block_pair, int32_t *block_route,
+                                int pairs, int topk) {
+    const int p = threadIdx.x;
+    for (int i = p; i < pairs; i += blockDim.x) block_slot[i] = -1;
+    for (int i = p; i < (pairs << 4); i += blockDim.x) {
+        block_pair[i] = -1;
+        block_route[i] = -1;
+    }
+    __shared__ int32_t key[kRouteWideMax];
+    __shared__ int32_t sorted_slot[kRouteWideMax];
+    __shared__ int32_t sorted_pair[kRouteWideMax];
+    if (p < pairs) key[p] = slots[p];
+    __syncthreads();
+    if (p < pairs) {
+        const int32_t mine = key[p];
+        int rank = 0;
+        for (int i = 0; i < pairs; ++i) {
+            const int32_t other = key[i];
+            rank += (other < mine) || (other == mine && i < p);
+        }
+        sorted_slot[rank] = mine;
+        sorted_pair[rank] = p;
+    }
+    __syncthreads();
+    if (p != 0) return;
+    int block = -1, rank = 0;
+    int32_t previous = INT32_MIN;
+    for (int i = 0; i < pairs; ++i) {
+        const int32_t value = sorted_slot[i];
+        if (!i || value != previous || rank == kBlockM) {
+            ++block; rank = 0; previous = value; block_slot[block] = value;
+        }
+        const int index = (block << 4) + rank;
+        block_pair[index] = sorted_pair[i];
+        block_route[index] = sorted_pair[i] | ((sorted_pair[i] / topk) << 16);
+        ++rank;
+    }
+}
+
 __global__ void round_reduce(const float *parts, void *out, int td, int topk, int out_bf16) {
     // This internal kernel is always launched with 256 threads below.
     const int i = (static_cast<int>(blockIdx.x) << 8) + threadIdx.x;
@@ -780,6 +827,13 @@ extern "C" int fp4_moe_cuda_down_v2(
 extern "C" int fp4_moe_cuda_route_small(void *stream, const void *slots, void *block_slot,
                                           void *block_pair, void *block_route,
                                           int pairs, int topk) {
+    if (pairs > 64) {
+        if (pairs > kRouteWideMax) return static_cast<int>(cudaErrorInvalidValue);
+        route_wide_bm16<<<1, kRouteWideMax, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const int32_t *>(slots), static_cast<int32_t *>(block_slot),
+            static_cast<int32_t *>(block_pair), static_cast<int32_t *>(block_route), pairs, topk);
+        return static_cast<int>(cudaGetLastError());
+    }
     route_small_bm16<<<1, 64, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const int32_t *>(slots), static_cast<int32_t *>(block_slot),
         static_cast<int32_t *>(block_pair), static_cast<int32_t *>(block_route), pairs, topk);

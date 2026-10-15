@@ -2,7 +2,8 @@
 
 `DSV41_BLOCK_DYNAMIC=3,5` lets the engine choose the draft depth per request, as acceptance
 changes. Code off by default; both `.env.example.*` profiles enable it. It is in the EP2 boot guard, and it
-cannot be combined with `DSV41_BLOCK` or with `DSV41_MAX_CONCURRENCY` > 1.
+cannot be combined with `DSV41_BLOCK`. Concurrent lanes (docs/concurrency.md) receive rank 0's depth through their
+control broadcast and each keep their own policy.
 
 ## Why
 
@@ -169,7 +170,8 @@ broadcast to both ranks and width-2 graph qualification before enabling depth 1.
 
 `DSV41_BLOCK_CONFIDENCE=1` enables a greedy-only experiment using depths 1/3/5.
 Leave `DSV41_BLOCK_DYNAMIC=3,5` in place, and leave `DSV41_BLOCK` unset or set it
-to 5. Speculation, the graphed fast path and concurrency 1 are required. The
+to 5. Speculation and the graphed fast path are required (above concurrency 1 it is allowed but not
+yet exercised). The
 flag defaults to 0; the serving `.env` is unchanged.
 
 For each draft, rank 0 calculates

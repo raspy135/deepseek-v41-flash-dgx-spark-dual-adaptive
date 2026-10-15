@@ -78,6 +78,7 @@ class RowParallelWeight:
         return self.tp_linear(x, act_qdq=True)
 
     def tp_linear(self, x, act_qdq: bool = False):
+        import decode_rows
         import v41_ref as R
         from fp8_linear import FP8Weight, fp8_linear
         x = x.to(torch.bfloat16)
@@ -85,7 +86,7 @@ class RowParallelWeight:
         flat = x.reshape(-1, shape[-1])
         if act_qdq:
             partial = fp8_linear(flat, self.local, out_dtype=torch.float32, act_qdq=True)
-        elif isinstance(self.local, FP8Weight) and flat.size(0) <= 16:
+        elif isinstance(self.local, FP8Weight) and flat.size(0) <= decode_rows.limit():
             partial = fp8_linear(flat, self.local, out_dtype=torch.float32)
         else:
             weight = self.local if isinstance(self.local, torch.Tensor) else self.local.dequant()

@@ -106,10 +106,12 @@ Discovery batches complete token rows so their cold experts fit the
 transient ring; both TP ranks receive the same batch plan. Decode lookup tables
 and masks update in place; changed layers' eager prefill directories are rebuilt.
 This experimental mode supports ordinary resident prefill with
-`USER_PROMPT_STREAM=0`. It requires concurrency 1, adaptive pruned residency,
+`USER_PROMPT_STREAM=0`, also with concurrent requests (docs/concurrency.md). It requires adaptive pruned residency,
 `PRUNE_MISS=1`, resident LUTs, no replicas/fixed profiles/layer streaming, and
-disk/response caching and prefill graphs disabled. With prompt streaming off,
-`DSV41_PREFIX_CACHE=1` can reuse RAM prefixes. These retain historical encoder
+response caching and prefill graphs disabled. With prompt streaming off,
+`DSV41_PREFIX_CACHE=1` can reuse RAM prefixes and `DSV41_PREFIX_DISK=1` disk ones (since
+2026-10-14; with `DSV41_PREFIX_DISK_STRICT=1` a cross-layer swap refreshes the routing signature
+bundles match on). These retain historical encoder
 state after expert swaps, as in the original adaptive policy; they do not
 recompute old tokens under the new expert selection. Latest-user streaming
 still requires all prefix caching off. Global startup and ordinary demand-based

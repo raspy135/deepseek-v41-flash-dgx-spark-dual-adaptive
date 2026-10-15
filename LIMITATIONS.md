@@ -54,8 +54,9 @@ are in RESULTS.md. What follows is what is still missing or broken.
 * **No quality evaluation beyond teacher forcing.** The ±0.05 nats agreement with the pure-torch
   port (RESULTS.md 2) proves the *engine* matches the *port*; it does not prove either matches the
   reference tilelang kernels, and no benchmark suite (MMLU, HumanEval, ...) was run.
-* **Batch size is 1 and there is no concurrency story.** The server serialises requests on one
-  lock. It also only notices a dead client when it next writes a chunk, so a request that was
+* **Batch size is 1 by default.** The server serialises requests on one lock. (Since 2026-10-14
+  `DSV41_MAX_CONCURRENCY=N` batches the verify steps of up to 8 TP2 requests with the adaptive
+  features on -- docs/concurrency.md.) It also only notices a dead client when it next writes a chunk, so a request that was
   already queued when its client died keeps the engine busy for its whole `max_tokens` budget;
   there is no cancel endpoint and no queue cap. `/health` reports `busy` honestly, and the only
   recovery is a restart.

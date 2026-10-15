@@ -585,15 +585,19 @@ class V41Engine:
         if self.dynamic_experts:
             if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
                 raise ValueError('dynamic allocation requires adaptive pruned residency without layer streaming')
-            if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
-                raise ValueError('dynamic allocation requires concurrency 1')
+            # Concurrent lanes (DSV41_MAX_CONCURRENCY > 1) are fine: a cross-layer transfer edits the
+            # shared slot table and masks in place, at a scheduler boundary where no lane is
+            # mid-step (apply_global_swaps; engine/serving.py carries the reassigned state).
             if os.environ.get('DSV41_LUT', '1') != '1' or os.environ.get('DSV41_PRUNE_MISS', '0') != '1':
                 raise ValueError('dynamic allocation requires resident LUTs and PRUNE_MISS=1')
             # RAM prefixes contain encoder state, not expert-sector addresses.
             # With resident prefill they can retain historical KV across global
             # swaps, just as with the original within-layer adaptive policy.
             # Streaming still requires a fresh discovery/rebuild below.
-            for key in ('DSV41_PREFIX_DISK', 'DSV41_PREFIX_RESPONSE', 'DSV41_PREFILL_GRAPHS'):
+            # Disk prefixes are the same historical KV, written and read back: with
+            # DSV41_PREFIX_DISK_STRICT=0 any layout's bundle is reused, as the RAM cache does;
+            # with 1, apply_global_swaps refreshes the routing signature bundles match on.
+            for key in ('DSV41_PREFIX_RESPONSE', 'DSV41_PREFILL_GRAPHS'):
                 if os.environ.get(key, '1' if key == 'DSV41_PREFIX_CACHE' else '0') != '0':
                     raise ValueError('dynamic allocation requires '+key+'=0')
         if self.user_prompt_stream:
@@ -943,8 +947,21 @@ class V41Engine:
                                  f"{exact_bytes / 1e9:.2f} (have {arena_gb})")
             arena_gb = exact_bytes / 1e9
             self.exl3_exact = (narrow, n_wide)
+        # DSV41_MAX_CONCURRENCY > 1: the lanes are built after this, so reserve them here -- out of
+        # the arena. ARENA_GB is tuned against the box's steady state for one request (the
+        # profiles sit at the memory ceiling: a 98 GB arena loads with ~110 GB available and
+        # settles with ~6 GB free), and the cap below only bites when the arena exceeds what is
+        # available *now*, which a tuned arena does not. Taking the lanes out of the cap alone left
+        # the arena as it was and the lanes in the steady-state margin: rank 1 reached the memory
+        # watchdog 17 minutes into a 2-lane session on the 512K / 98.4 GB profile.
+        from engine.serving import lane_reserve_bytes
+        lane_bytes = lane_reserve_bytes(self.args, max_seq)
+        if lane_bytes and not auto and not self.exl3_exact:
+            log(f"concurrency: arena {arena_gb:.1f} GB less {lane_bytes / 1e9:.2f} GB for the extra "
+                f"lanes and batched graphs")
+            arena_gb = max(10.0, arena_gb - lane_bytes / 1e9)
         if host_avail is not None:
-            cap = (host_avail - keep_free_gb * 1e9 - replica_bytes) / 1e9
+            cap = (host_avail - keep_free_gb * 1e9 - replica_bytes - lane_bytes) / 1e9
             if cap < 10.0:
                 # Refuse rather than squeeze. A cap this low means the host has no memory to give:
                 # another engine is still resident, or the kernel has not finished reclaiming the
@@ -962,7 +979,7 @@ class V41Engine:
                                        f"is free above keep_free {keep_free_gb} GB (MemAvailable "
                                        f"{host_avail / 1e9:.1f} GB): free memory (context, caches, vision) or turn it off")
                 log(f"arena {arena_gb:.1f} GB capped to {cap:.1f} GB (MemAvailable {host_avail / 1e9:.1f} GB, "
-                    f"keep_free {keep_free_gb} GB)")
+                    f"keep_free {keep_free_gb} GB" + (f", lanes {lane_bytes / 1e9:.2f} GB)" if lane_bytes else ")"))
                 arena_gb = max(10.0, cap)
             # A pinned arena is checked against what is free *now*, but the warm start needs more on
             # top of it: the 3-bit packer works on the GPU in scratch buffers, and a chunked prefill
@@ -975,7 +992,7 @@ class V41Engine:
             # free -- rather than a pessimistic sum, because refusing a configuration that works is
             # its own failure. The MemoryWatchdog below is the backstop if this estimate is wrong.
             pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
-            need = arena_gb * 1e9 + replica_bytes + pack_scratch + keep_free_gb * 1e9
+            need = arena_gb * 1e9 + replica_bytes + lane_bytes + pack_scratch + keep_free_gb * 1e9
             if need > host_avail:
                 raise RuntimeError(
                     f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
@@ -1253,8 +1270,9 @@ class V41Engine:
                     or self.stream_layers or self.critical.enabled):
                 raise ValueError('predictive prefill requires dynamic TP2 request-unit adaptation without streaming')
             if self.predictive.backend == 'probe':
-                if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1' or self.layer_ablation.path:
-                    raise ValueError('computed prefill probes require concurrency 1 and no layer ablation')
+                # Concurrent lanes: probes run inside one lane's prefill, which is sequential.
+                if self.layer_ablation.path:
+                    raise ValueError('computed prefill probes require no layer ablation')
                 if self.predictive.probe.two_pass_below and not self.swa_replay:
                     raise ValueError('two-pass suffix discovery requires SWA replay')
         self.model.user_prompt = self.user_prompt
@@ -1357,6 +1375,14 @@ class V41Engine:
                 "arena_slots": int(getattr(self.store.arena, "slots", 0)),
                 "spec": bool(self.spec),
                 "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
+                # Lane caches size the batched step's per-lane indexer buckets and graph keys.
+                "lane_max_seq": os.environ.get("DSV41_LANE_MAX_SEQ", "65536"),
+                # Graph releases must happen at the same step on both ranks.
+                "batch_idle_steps": os.environ.get("DSV41_BATCH_IDLE_STEPS", "0"),
+                "lane_reserve_gb": os.environ.get("DSV41_LANE_RESERVE_GB", ""),
+                # 3: graphs kept across requests; batched rounds left out of the depth policy's
+                # step times.
+                "batch_decode_version": 3,
                 "max_seq": int(self.max_context),
                 "topk": int(self.args.n_activated_experts),
                 "index_topk": self.args.index_topk,
@@ -1637,12 +1663,12 @@ class V41Engine:
         self.depth_policy = None
         self.confidence_depth_policy = None
         if (DYNAMIC_DEPTHS or CONFIDENCE_DEPTHS) and (exl3_cls is None or self.exl3_cuda):
-            # Scope: the single-request greedy/sampled graphed path. Two-request serving
-            # (engine/batch2.py) and the eager path stack or verify T_VERIFY rows unconditionally.
+            # Scope: the single-request greedy/sampled graphed path. Batched serving
+            # (engine/batch_decode.py) and the eager path verify T_VERIFY rows unconditionally.
             if not (self.spec and self.fast is not None and self.fast.use_graphs):
                 raise ValueError("variable speculative depth needs speculative decoding on the graphed fast path")
-            if int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) != 1:
-                raise ValueError("variable speculative depth supports DSV41_MAX_CONCURRENCY=1 only")
+            # Concurrent lanes: rank 0's depth reaches rank 1 through the lane's control broadcast,
+            # and the batched step verifies a narrower block as masked rows (engine/batch_decode.py).
             from engine.spec_depth import DepthPolicy, ConfidenceDepthPolicy
             self.depth_policy = DepthPolicy(DYNAMIC_DEPTHS or (3, 5))
             if CONFIDENCE_DEPTHS:
@@ -1897,7 +1923,13 @@ class V41Engine:
                                       seed, ignore_eos, grammar, penalties, user_prompt_ranges)
 
     def _policy_step_s(self, t_iter: float, n_captures: int | None):
-        """Wall time of this decode step for DepthPolicy, or None if it captured a graph."""
+        """Wall time of this decode step for DepthPolicy, or None if it captured a graph or was
+        verified in a batched round (engine/serving.py). A batched round's wall time is set by
+        every lane in it, so depth 3 and 5 read alike; learned from it, the policy carried ~3x
+        step costs into later solo steps (2026-10-14 gate log: depth 3 estimated at 17 tok/s on a
+        lone request running ~50)."""
+        if getattr(self, "_last_verify_batched", False):
+            return None
         # Pool rotation can replace a graph without changing the live count
         # (notably at DSV41_GRAPHS_MAX=1). Missing legacy counters fail closed:
         # an unknown capture state must not train the policy's step costs.
@@ -2507,6 +2539,11 @@ class V41Engine:
         self.expert_generation += 1
         focus.resident_loads = getattr(focus, 'resident_loads', 0) + len(swaps)
         self.resident_layer_counts = [counts[L] for L in sorted(counts)]
+        if getattr(self, 'prefix_disk', None) is not None:
+            # as apply_swaps does: DSV41_PREFIX_DISK_STRICT=1 matches bundles on this signature,
+            # and a stale one would admit KV computed under a different expert layout
+            from engine.prefix_persistence import routing_signature
+            self._prefix_route = routing_signature(self)
         log(f'adapted {len(swaps)} global expert sectors '
             f'({sum(Lo != Li for Lo,eo,Li,ei,g in swaps)} across layers; '
             f'residents/layer {min(counts.values())}-{max(counts.values())}, generation {self.expert_generation})')
@@ -3049,9 +3086,9 @@ class V41Engine:
         out_st['draft_bypass'] = bypass
         # Decode-time expert adaptation (engine/adapt_config.py: every ADAPT.decode_tokens
         # output tokens, gated on that stretch's miss rate). Rank 0 decides; control() carries
-        # the flag so both ranks run the pass at the same step. Single-request serving only.
+        # the flag so both ranks run the pass at the same step. A concurrent lane's control is
+        # the same broadcast, and the pass runs while every other lane waits at its boundary.
         decode_adapt = (ADAPT.decode_tokens > 0 and self.ep.rank == 0 and self.ep.active
-                        and int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")) == 1
                         and getattr(self, "model_prune_mask", None))
         decode_snapshot = (self.model.decode_miss_snapshot if self.fast is not None
                            else self.model.miss_snapshot)
@@ -3416,7 +3453,8 @@ class V41Engine:
         """Rank 0 selects a proposal mode before any current proposal is drawn.
 
         Positive = DSpark depth; negative = copied depth; zero = root-only.
-        Every rank follows the same control value, including all graph collectives.
+        Every rank follows the same control value, including all graph collectives. Rank 1's 0 is
+        a placeholder the broadcast replaces -- concurrent lanes included (ScheduledPeer.control).
         """
         if self.ep.rank != 0 or not keep_going:
             return 0

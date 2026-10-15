@@ -53,7 +53,8 @@ def make_packed_head(weight):
             if xb.shape[0] == 0:
                 return torch.empty((*shape[:-1], self.shape[0]), dtype=torch.float32,
                                    device=self.device)
-            if xb.shape[0] <= 16:
+            import decode_rows
+            if xb.shape[0] <= decode_rows.limit():
                 from head_packed_gluon import project
                 out = project(xb, self, bn=32, bk=128, warps=4, stages=1)
             else:

@@ -15,6 +15,7 @@ class ResponseDeliveryTests(unittest.TestCase):
         scheduler = object.__new__(Scheduler)
         scheduler.pending, scheduler.cache_jobs = queue.Queue(), queue.Queue(maxsize=2)
         scheduler.failure, scheduler.stopping = None, threading.Event()
+        scheduler.n = 2
         scheduler.state = SimpleNamespace(lock=threading.Lock())
         scheduler._dispatch = Mock()
         for _ in range(4):

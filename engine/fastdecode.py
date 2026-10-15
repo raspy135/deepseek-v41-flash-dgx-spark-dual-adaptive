@@ -638,11 +638,27 @@ class FastDecoder:
         result to bf16 itself. Same values at every step; 4 launches fewer per layer."""
         a = self.a
         T = x.size(0)
-        rd = a.rope_head_dim
         self._pf_wait("qkv")
         self._pf_wait("wq_b")
         x3 = getattr(w, "_x3", None)
         q_b = x3.wq_b(qr) if x3 is not None else R.qlinear(qr, w.wq_b)
+        o = self._attn_core_lean(x, qr, q_b, kv_lin, w, L, ring, fq, pos, sh_state,
+                                 prefetch=bool(self.attn_prefetch_mb and self.l2pf_side is not None))
+        if x3 is not None:
+            return x3.wo_b(x3.wo_a(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)))
+        o = R.wo_a_proj(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1), w.wo_a, tiled=True)
+        return R.qlinear(o.flatten(1), w.wo_b)
+
+    def _attn_core_lean(self, x, qr, q_b, kv_lin, w, L, ring, fq, pos, sh_state, prefetch=False):
+        """The part of _attention_lean that reads and writes this sequence's caches: RoPE, the
+        window ring, the compressor/indexer, the key block and the attention itself, from the
+        projections `q_b` and `kv_lin` to the inverse-RoPE'd output [T, heads, head_dim] bf16.
+        Nothing here reads a large weight except the compressor/indexer's own; batched decode
+        (engine/batch_decode.py) runs this per sequence between projections it shares."""
+        a = self.a
+        T = x.size(0)
+        rd = a.rope_head_dim
+        x3 = getattr(w, "_x3", None)
         qf = self.lean.rope(q_b.view(T, getattr(w, 'tp_heads', a.n_heads), a.head_dim),
                             fq, rd, out_f32=True)
         kv = self.lean.rope(self._rmsnorm(kv_lin, w.kv_norm, a.norm_eps), fq, rd)
@@ -655,7 +671,6 @@ class FastDecoder:
         # This window is attention arithmetic, longer than the RoCE-only site.
         # Prefetch only this layer's output projection; next-layer weights would
         # be evicted by MoE before use. The graph joins before consuming weights.
-        prefetch = self.attn_prefetch_mb and self.l2pf_side is not None
         if prefetch:
             self.l2pf_side.wait_stream(torch.cuda.current_stream())
             l2pf.touch(self.l2pf_side, [x3.wo_a, x3.wo_b] if x3 is not None else [w.wo_a, w.wo_b],
@@ -672,10 +687,7 @@ class FastDecoder:
         o = self.lean.rope(raw, fq, rd, inverse=True)
         if prefetch:
             torch.cuda.current_stream().wait_stream(self.l2pf_side)
-        if x3 is not None:
-            return x3.wo_b(x3.wo_a(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1)))
-        o = R.wo_a_proj(o.reshape(T, getattr(w, 'tp_groups', a.o_groups), -1), w.wo_a, tiled=True)
-        return R.qlinear(o.flatten(1), w.wo_b)
+        return o
 
     def _verify_attention_product(self, equation, left, right):
         # CUDA's batch-1 SGEMM accumulates differently from batch>=2 BMM. In
@@ -834,23 +846,39 @@ class FastDecoder:
         if fmt not in ('off', 'bf16', 'fp8', 'fp4'):
             raise ValueError(f"markov head format {fmt!r} must be off, bf16, fp8 or fp4")
         self.markov_fmt = fmt
-        src = self.W.mtp[2].markov_head
-        self.markov_head_bf16 = src if fmt in ('off', 'bf16') else R._head_in_format(src, fmt)
+        block = self.W.mtp[2]
+        src = block.markov_head
+        # Every derived head is a pure function of the shared weights, so it is made once per
+        # process and kept on the weights: a concurrent lane is one more decoder over them.
+        derived = getattr(block, '_markov_derived', None)
+        if derived is None:
+            derived = {}
+            setattr(block, '_markov_derived', derived)
+
+        def once(key, make):
+            if key not in derived:
+                derived[key] = make()
+            return derived[key]
+
+        self.markov_head_bf16 = (src if fmt in ('off', 'bf16')
+                                 else once(('head', fmt), lambda: R._head_in_format(src, fmt)))
         listed = getattr(self.draft_head, 'ids_local', None)
         if listed is not None:
             # DSV41_DRAFT_VOCAB: the split chain scores the listed head's own columns, so its Markov
             # rows are those ids, gathered once into contiguous storage (21 MB of bf16 at 40,960 a
             # rank, under the 24 MiB L2 -- whether the five back-to-back reads then hit it is a
             # trace question, not an assumption).
-            local = src.index_select(0, listed.to(torch.int64))
-            self.markov_head_local = local if fmt in ('off', 'bf16') else R._head_in_format(local, fmt)
+            local = once(('listed', listed.data_ptr()), lambda: src.index_select(0, listed.to(torch.int64)))
+            self.markov_head_local = (local if fmt in ('off', 'bf16') else
+                                      once(('listed', listed.data_ptr(), fmt), lambda: R._head_in_format(local, fmt)))
         elif self.markov_head_local is not None or hasattr(self.draft_head, 'world'):
             rows = self.draft_head.local.shape[0]
             # off/bf16 keep the strided row view the drafter always passed cuBLAS; only a quantized
             # copy needs its own contiguous storage.
             local = src[self._markov_rank * rows:(self._markov_rank + 1) * rows]
-            self.markov_head_local = (local if fmt in ('off', 'bf16')
-                                      else R._head_in_format(local.contiguous(), fmt))
+            self.markov_head_local = (local if fmt in ('off', 'bf16') else
+                                      once(('shard', self._markov_rank, rows, fmt),
+                                           lambda: R._head_in_format(local.contiguous(), fmt)))
 
     def _layer_a(self, L, sh_state):
         """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos."""
@@ -1235,9 +1263,15 @@ class FastDecoder:
         self.pre_mix.copy_(self.ffn_pre)
 
     def _final(self):
+        self.logits.copy_(R.head_logits(self._final_x(), self.head))
+        self._seed_draft_rings()
+
+    def _final_x(self):
+        """The head's input: the final norm over the collapsed residual streams."""
+        return self._rmsnorm(R.hc_pre(self.h, self.pre_mix), self.W.norm, self.a.norm_eps)
+
+    def _seed_draft_rings(self):
         a = self.a
-        x = self._rmsnorm(R.hc_pre(self.h, self.pre_mix), self.W.norm, a.norm_eps)
-        self.logits.copy_(R.head_logits(x, self.head))
         # seed the drafter rings for all 6 positions (harmless beyond the accepted ones)
         m0 = self.W.mtp[0]
         x3 = getattr(m0, "_x3", None)

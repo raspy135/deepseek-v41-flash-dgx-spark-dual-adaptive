@@ -5,6 +5,8 @@ block), x bf16 [M, K]. The weights are never dequantized to bf16 in memory, whic
 bytes read per decode step and the resident footprint of the dense layers.
 
 Two tile shapes: BLOCK_M=16 for decode-sized M (padded up to 16 rows) and BLOCK_M=64 for prefill.
+Batched multi-request decode widens the decode tile to 32/64 rows inside `decode_rows.wide()`
+(tools/decode_rows.py); outside it nothing changes.
 Weights are dequantized to bf16 inside each tile using their 32x32 power-of-two scales;
 the dot product accumulates in fp32 over fixed 128-wide K tiles (64 for unaligned K).
 """
@@ -17,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+
+import decode_rows
 
 # Decode-sized (M <= 16) scheduling. The grid is N / BLOCK_N CTAs, and GB10 has 48 SMs: at the
 # default 128 the narrow projections launch 4 (wkv, N=512), 9 (TP shared w1/w3, N=1152) or 10
@@ -331,6 +335,17 @@ def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:
     return FP8Weight(codes, scales)
 
 
+def _wide_block_k(block_m: int, block_n: int, block_k: int) -> int:
+    """K tile for the wide (32/64-row) decode tiles of batched decode. DSV41_FP8_DECODE_BLOCK_K=256
+    at 64 rows stages ~40 KB a pipeline stage, 115 KB over three: past GB10's 99 KB of shared
+    memory, and the launch fails. Halving K keeps each output's accumulation in the same K order, so
+    it is meant to be bit-identical (tools/test_decode_rows.py compares against the 16-row tile at
+    K 256). The 16-row tile never comes here."""
+    if block_m > 16 and block_k > 128 and block_m * block_k * 2 + block_n * block_k > 32 * 1024:
+        return 128
+    return block_k
+
+
 def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16, act_qdq: bool = False) -> torch.Tensor:
     """x bf16 [..., K] -> bf16 [..., N].
 
@@ -338,20 +353,22 @@ def fp8_linear(x: torch.Tensor, W: FP8Weight, out_dtype=torch.bfloat16, act_qdq:
     kernels before it. Decode-sized bf16 input only: the torch spelling quantizes from x's own
     dtype, and an fp32 x would first be rounded to bf16 here."""
     shape = x.shape
-    if act_qdq and (x.dtype != torch.bfloat16 or x.numel() // x.shape[-1] > 16):
-        raise ValueError(f"fused act_qdq needs bf16 input with <= 16 rows, got {x.dtype} {tuple(x.shape)}")
+    rows = decode_rows.limit()
+    if act_qdq and (x.dtype != torch.bfloat16 or x.numel() // x.shape[-1] > rows):
+        raise ValueError(f"fused act_qdq needs bf16 input with <= {rows} rows, got {x.dtype} {tuple(x.shape)}")
     x2 = x.reshape(-1, W.K)
     if x2.dtype != torch.bfloat16:
         x2 = x2.to(torch.bfloat16)
     x2 = x2.contiguous()
     M = x2.size(0)
     y = torch.empty(M, W.N, dtype=out_dtype, device=x.device)
-    decode = M <= 16
-    BLOCK_M = 16 if decode else 64
+    decode = M <= rows
+    BLOCK_M = decode_rows.block_m(M) if decode else 64
     BLOCK_N = decode_block_n(W.N, 1, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
     if decode and BLOCK_K == 128 and W.K % DECODE_BLOCK_K == 0:
         BLOCK_K = DECODE_BLOCK_K
+    BLOCK_K = _wide_block_k(BLOCK_M, BLOCK_N, BLOCK_K)
     pipeline = decode and DECODE_PIPELINE
     grid = (triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))
     _fp8_linear_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K, x2.stride(0), W.w.stride(0), W.s.stride(0), y.stride(0),
@@ -406,12 +423,13 @@ def fp8_grouped_linear(x: torch.Tensor, W: FP8GroupedWeight) -> torch.Tensor:
     x = x.contiguous()
     T = x.size(0)
     y = torch.empty(T, W.G, W.R, dtype=torch.bfloat16, device=x.device)
-    decode = T <= 16
-    BLOCK_M = 16 if decode else 64
+    decode = T <= decode_rows.limit()
+    BLOCK_M = decode_rows.block_m(T) if decode else 64
     BLOCK_N = decode_block_n(W.R, W.G, x.device) if decode else 128
     BLOCK_K = 128 if W.K % 128 == 0 else 64
     if decode and BLOCK_K == 128 and W.K % DECODE_BLOCK_K == 0:
         BLOCK_K = DECODE_BLOCK_K
+    BLOCK_K = _wide_block_k(BLOCK_M, BLOCK_N, BLOCK_K)
     pipeline = decode and DECODE_PIPELINE
     grid = (triton.cdiv(W.R, BLOCK_N), triton.cdiv(T, BLOCK_M), W.G)
     _fp8_grouped_kernel[grid](x, W.w, W.s, y, T, W.R, W.K,

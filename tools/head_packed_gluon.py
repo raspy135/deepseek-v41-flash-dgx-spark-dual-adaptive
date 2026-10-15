@@ -22,6 +22,8 @@ Production remains opt-in. See RESULTS.md and tools/test_native_head.py.
 import torch
 import triton
 from triton.experimental import gluon as g
+
+import decode_rows
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import (
     BlockedLayout, DotOperandLayout, NVMMADistributedLayout, SliceLayout,
@@ -43,7 +45,8 @@ def clear_packed_cache():
 def _project(X, LOW, DELTA, HEADER, ESCAPE, OUT,
              M: gl.constexpr, N: gl.constexpr, K: gl.constexpr,
              XM: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr,
-             WARPS: gl.constexpr, RAW: gl.constexpr, TILED: gl.constexpr):
+             WARPS: gl.constexpr, RAW: gl.constexpr, TILED: gl.constexpr,
+             BM: gl.constexpr = 16):
     xl: gl.constexpr = BlockedLayout([1, 8], [2, 16], [WARPS, 1], [1, 0])
     wl: gl.constexpr = BlockedLayout([8, 1], [16, 2], [1, WARPS], [0, 1])
     ol: gl.constexpr = BlockedLayout([1, 4], [2, 16], [WARPS, 1], [1, 0])
@@ -52,9 +55,11 @@ def _project(X, LOW, DELTA, HEADER, ESCAPE, OUT,
     bl: gl.constexpr = DotOperandLayout(1, ml, 2)
     ns = gl.program_id(0)*BN + gl.arange(0, BN, layout=SliceLayout(0, wl))
     ks = gl.arange(0, BK, layout=SliceLayout(1, wl))
-    ms_x = gl.arange(0, 16, layout=SliceLayout(1, xl))
+    # BM row tiles of the same m16n8k16 MMA: each logit is still one chain over K in BK steps,
+    # so a row's value does not depend on how many rows share the call (tools/test_decode_rows.py).
+    ms_x = gl.arange(0, BM, layout=SliceLayout(1, xl))
     ks_x = gl.arange(0, BK, layout=SliceLayout(0, xl))
-    acc = gl.full((16, BN), 0, gl.float32, ml)
+    acc = gl.full((BM, BN), 0, gl.float32, ml)
     for start in range(0, K, BK):
         x = gl.load(X + ms_x[:, None]*XM + start + ks_x[None, :],
                     ms_x[:, None] < M, 0)
@@ -85,17 +90,18 @@ def _project(X, LOW, DELTA, HEADER, ESCAPE, OUT,
         acc = mma_v2(gl.convert_layout(x, al), gl.convert_layout(w, bl), acc)
     value = acc if RAW else acc.to(gl.bfloat16).to(gl.float32)
     value = gl.convert_layout(value, ol)
-    ms = gl.arange(0, 16, layout=SliceLayout(1, ol))
+    ms = gl.arange(0, BM, layout=SliceLayout(1, ol))
     no = gl.program_id(0)*BN + gl.arange(0, BN, layout=SliceLayout(0, ol))
     gl.store(OUT + ms[:, None]*N + no[None, :], value,
              (ms[:, None] < M) & (no[None, :] < N))
 
 
 def project(x, weight, *, bn=64, bk=128, split=1, warps=4, stages=1, raw=False):
-    """BF16 [1..16,K] and PackedHead -> BF16-rounded FP32 local logits."""
+    """BF16 [1..16,K] and PackedHead -> BF16-rounded FP32 local logits. Up to 64 rows inside
+    decode_rows.wide() (batched multi-request decode), in one 32- or 64-row tile."""
     if not isinstance(weight, (PackedHead, TiledPackedHead)):
         raise TypeError('prepare PackedHead before capture')
-    if (x.dtype != torch.bfloat16 or x.ndim != 2 or not 0 < x.shape[0] <= 16
+    if (x.dtype != torch.bfloat16 or x.ndim != 2 or not 0 < x.shape[0] <= decode_rows.limit()
             or x.shape[1] != weight.shape[1] or x.stride(1) != 1
             or x.device != weight.device or x.device.type != 'cuda'):
         raise ValueError('expected BF16 decode activations matching the packed head')
@@ -107,7 +113,7 @@ def project(x, weight, *, bn=64, bk=128, split=1, warps=4, stages=1, raw=False):
     out = torch.empty((m, n), dtype=torch.float32, device=x.device)
     _project[(triton.cdiv(n, bn),)](x, weight.low, weight.delta, weight.header,
         weight.escape, out, m, n, k, x.stride(0), BN=bn, BK=bk, WARPS=warps,
-        RAW=raw, TILED=isinstance(weight, TiledPackedHead),
+        RAW=raw, TILED=isinstance(weight, TiledPackedHead), BM=decode_rows.block_m(m),
         num_warps=warps, num_stages=stages)
     return out
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """OpenAI-compatible HTTP server for the DeepSeek-V4.1-Flash engine.
 
-Standard library HTTP server. Requests are serialized by default; the opt-in
-two-lane TP scheduler batches independent speculative verification steps.
+Standard library HTTP server. Requests are serialized by default; with
+DSV41_MAX_CONCURRENCY > 1 (TP only) a queue feeds N lanes whose speculative
+verification steps run batched, one weight pass for all of them.
 
 Endpoints
     GET  /health
@@ -622,10 +623,8 @@ class State:
                 tok, engine.eos_token_id if self.eos_id is None else self.eos_id,
                 enabled=os.environ.get("DSV41_TOOL_GRAMMAR", "0") == "1")  # off until the end-to-end gates on real weights have run; see NOTES 2026-09-11
         self.scheduler = None
-        concurrency = int(os.environ.get('DSV41_MAX_CONCURRENCY', '1'))
-        if concurrency not in (1, 2):
-            raise ValueError('DSV41_MAX_CONCURRENCY must be 1 or 2')
-        if concurrency == 2:
+        from engine.serving import concurrency
+        if concurrency() > 1:
             from engine.serving import DecodeRuntime
             from server.concurrency import Scheduler
             self.scheduler = Scheduler(self, DecodeRuntime(engine))
@@ -1213,6 +1212,18 @@ class Handler(BaseHTTPRequestHandler):
                         "model": st.model_name, "engine": st.args.engine,
                         "busy": st.lock.locked(), "max_context": st.engine.max_context,
                         "uptime_s": int(time.time()) - st.started}
+                scheduler = getattr(st, "scheduler", None)
+                if scheduler is not None:
+                    # Read without the GPU lock while the scheduler thread mutates these; a torn
+                    # read is possible and must not fail the health check.
+                    try:
+                        rt = scheduler.runtime
+                        body["concurrency"] = {
+                            "lanes": scheduler.n, "lane_context": list(scheduler.capacity),
+                            "active": sorted(rt.generators), "queued": scheduler.pending.qsize(),
+                            "batch": rt.batch.memory_report() if hasattr(rt, "batch") else None}
+                    except Exception:  # noqa: BLE001
+                        body["concurrency"] = {"lanes": scheduler.n}
                 if st.ep_fault:
                     # A wedged pair still answers /health; saying "ok" here is what would turn a
                     # dead peer into a silently half-serving cluster.
@@ -1502,7 +1513,8 @@ def run_worker(engine) -> None:
     import torch.distributed as X  # noqa: F401  (presence was checked by EPDistributed.init)
     ep = engine.ep
     runtime = None
-    if int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) == 2:
+    from engine.serving import concurrency
+    if concurrency() > 1:
         from engine.serving import DecodeRuntime
         runtime = DecodeRuntime(engine)
     log.info("EP2 rank %d: headless worker, waiting for requests from rank 0", ep.rank)
@@ -1530,6 +1542,9 @@ def run_worker(engine) -> None:
                     pass
                 os._exit(1)
             if req is None or req.get("cmd") == "shutdown":
+                # The head logs its broadcast; without this line a worker stuck in the teardown
+                # below (the head is already gone) looked like one that never heard it.
+                log.info("EP2 worker: shutdown from rank 0")
                 break
             if req.get('cmd') == 'schedule':
                 from engine.decode_events import event_signature

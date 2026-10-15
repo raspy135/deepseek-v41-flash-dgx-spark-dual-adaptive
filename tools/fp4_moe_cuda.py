@@ -114,8 +114,9 @@ def build_routing_small(slots: torch.Tensor, block_m: int, topk: int):
     if slots.dtype != torch.int32 or not slots.is_cuda or not slots.is_contiguous():
         raise ValueError("native decode router requires contiguous CUDA int32 slots")
     pairs = slots.numel()
-    if not 1 <= pairs <= 64:
-        raise ValueError("native decode router supports 1..64 pairs")
+    # 65..512 pairs (batched multi-request decode) take a parallel-rank sort with the same output.
+    if not 1 <= pairs <= 512:
+        raise ValueError("native decode router supports 1..512 pairs")
     if not 1 <= topk <= pairs:
         raise ValueError("native decode router requires 1 <= topk <= number of pairs")
     block_slot = torch.empty((pairs,), dtype=torch.int32, device=slots.device)

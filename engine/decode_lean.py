@@ -261,6 +261,25 @@ def _route_prep_kernel(IDX, LUT, SLOTS, ROUTE, P, NULL, PB: tl.constexpr):
 
 
 @triton.jit
+def _route_prep_masked_kernel(IDX, LUT, ACTIVE, SLOTS, ROUTE, P, K, NULL, PB: tl.constexpr):
+    """_route_prep_kernel for a batched step whose idle lanes' rows hold stale routes. A pair of an
+    inactive token row (ACTIVE[p // K] == 0) gets routing key -1: the router packs those into
+    16-pair blocks of slot -1 that both expert kernels skip outright, so an idle lane reads no
+    expert and costs no work. Its partial-output rows are left unwritten -- they belong to idle
+    rows only, which nothing reads. Giving idle pairs unique null keys instead (the null-slot
+    convention for live pairs) made the down kernel write zeros for every one of them across every
+    output row: 3.02 vs 2.59 ms a layer (native 6 rows: 2.63) with one of four lanes active, on a
+    single-GPU 96-slot arena, 2026-10-14. tools/test_decode_rows.py checks the skip is exact."""
+    p = tl.arange(0, PB)
+    m = p < P
+    live = tl.load(ACTIVE + p // K, mask=m, other=0) != 0
+    s = tl.load(LUT + tl.load(IDX + p, mask=m, other=0), mask=m, other=0)
+    s = tl.where(live, s, NULL)
+    tl.store(SLOTS + p, s, mask=m)
+    tl.store(ROUTE + p, tl.where(live, tl.where(s == NULL, NULL + 1 + p, s), -1), mask=m)
+
+
+@triton.jit
 def _block_null_kernel(BS, NB, NULL, NBB: tl.constexpr):
     """block_slot = where(block_slot > null, null, block_slot), in place."""
     b = tl.arange(0, NBB)
@@ -314,6 +333,10 @@ def _packed_gather_f32_kernel(Cache, Ids, Out, N, N2, N1, NTOT, D: tl.constexpr,
 ROPE_RE, ROPE_IM = 1, 2
 
 
+# id(gate fp32 weight) -> (that weight, its BF16 copy); the weight is held so the id stays its own.
+_ROUTER_BF16: dict = {}
+
+
 class LeanOps:
     """Static buffers plus the two decode ops. One instance per FastDecoder.
 
@@ -354,10 +377,15 @@ class LeanOps:
         for w in weights:
             if id(w) in self.router_weights:
                 continue
-            bf = w.to(torch.bfloat16)
-            if not torch.equal(w, bf.float()):
-                raise ValueError("BF16 router requires exactly BF16-representable checkpoint gates")
-            self.router_weights[id(w)] = bf
+            # One copy per gate for the process: every decoder over these weights (a concurrent
+            # lane is one) reads the same values, and 43 copies are 168 MB a decoder.
+            bf = _ROUTER_BF16.get(id(w))
+            if bf is None or bf[0] is not w:
+                value = w.to(torch.bfloat16)
+                if not torch.equal(w, value.float()):
+                    raise ValueError("BF16 router requires exactly BF16-representable checkpoint gates")
+                bf = _ROUTER_BF16[id(w)] = (w, value)
+            self.router_weights[id(w)] = bf[1]
 
     def _buf(self, key, shape, dtype=torch.float32):
         b = self._bufs.get(key)
@@ -504,6 +532,14 @@ class LeanOps:
         route = torch.empty(P, dtype=torch.int32, device=idx.device)
         _route_prep_kernel[(1,)](idx, lut_row, slots_out, route, P, int(null),
                                  PB=triton.next_power_of_2(P), num_warps=1)
+        return route.view(idx.shape)
+
+    def route_prep_masked(self, idx, lut_row, active, slots_out, null: int):
+        """route_prep with idle token rows (active[t] == 0, uint8 [T]) skipped: key -1, slot null."""
+        P = idx.numel()
+        route = torch.empty(P, dtype=torch.int32, device=idx.device)
+        _route_prep_masked_kernel[(1,)](idx, lut_row, active, slots_out, route, P, idx.shape[-1],
+                                        int(null), PB=triton.next_power_of_2(P), num_warps=4)
         return route.view(idx.shape)
 
     def block_null(self, block_slot, null: int):

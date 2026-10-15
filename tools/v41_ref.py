@@ -40,6 +40,8 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+import decode_rows
+
 try:
     from fp8_linear import FP8Weight, fp8_linear, quantize_to_fp8  # tools/fp8_linear.py (Triton); dense weights stay fp8 in memory
 except Exception:  # noqa: BLE001
@@ -620,7 +622,7 @@ def head_logits(x: torch.Tensor, head) -> torch.Tensor:
              or (FP4Weight is not None and isinstance(head, FP4Weight)))
     if quant:
         M = x.numel() // x.shape[-1]
-        if M > 16 and os.environ.get("DSV41_HEAD_PREFILL", "blocked") != "kernel":
+        if M > decode_rows.limit() and os.environ.get("DSV41_HEAD_PREFILL", "blocked") != "kernel":
             return _head_blocked(x.reshape(-1, x.shape[-1]), head).view(*x.shape[:-1], head.shape[0])
         fn = fp8_linear if isinstance(head, FP8Weight) else fp4_linear
         return fn(x.to(torch.bfloat16), head).float()
@@ -715,7 +717,7 @@ def dense(x: torch.Tensor, w) -> torch.Tensor:
             return fp4_linear(x, w)
         return F.linear(x.to(torch.bfloat16), w.dequant())
     if FP8Weight is not None and isinstance(w, FP8Weight):
-        if x.numel() // x.shape[-1] <= 16:
+        if x.numel() // x.shape[-1] <= decode_rows.limit():
             return fp8_linear(x, w)
         return F.linear(x.to(torch.bfloat16),
                         w.dequant_cached() if DENSE_DEQUANT_CACHE else w.dequant())
@@ -733,7 +735,7 @@ _ACT_QDQ_REF = act_qdq_fp8   # the fused path reproduces THIS function; engine/m
 def _act_qdq_fusable(x: torch.Tensor, w) -> bool:
     if not (ACT_QDQ_FUSED and act_qdq_fp8 is _ACT_QDQ_REF and FP8Weight is not None):
         return False
-    if x.dtype != torch.bfloat16 or not x.is_cuda or x.numel() // x.shape[-1] > 16:
+    if x.dtype != torch.bfloat16 or not x.is_cuda or x.numel() // x.shape[-1] > decode_rows.limit():
         return False
     if type(w) is FP8Weight:
         return x.shape[-1] == w.K
@@ -923,6 +925,14 @@ def engram_forward(h: torch.Tensor, rows: torch.Tensor, ew: EngramWeights, args:
     zeroing the gate is what stops a dead row from being written into the stream."""
     T = h.size(0)
     kv = qlinear(rows.reshape(T, -1).to(torch.bfloat16), ew.wkv)
+    return engram_combine(h, kv, ew, args, token_mask)
+
+
+def engram_combine(h: torch.Tensor, kv: torch.Tensor, ew: EngramWeights, args: Args,
+                   token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """engram_forward after its wkv projection `kv` [T, (hc + 1) * dim]: everything here is per
+    token row, so batched decode projects every sequence's rows at once and combines per sequence."""
+    T = h.size(0)
     key, value = kv.split([args.hc_mult * args.dim, args.dim], dim=-1)
     key = key.float().view(T, args.hc_mult, args.dim)
     weight = ew.q_weight * ew.k_weight

@@ -58,7 +58,7 @@ def main():
     # Exercise the scheduler's second lane and shared disk writer on both ranks.
     from engine.serving import DecodeRuntime
     from engine.decode_events import VerifyStep
-    runtime = DecodeRuntime(e)
+    runtime = DecodeRuntime(e, lanes=2)
     def run_lane(ids, limit):
         output = []
         event = runtime.execute({'op': 'start', 'lane': 1, 'prompt_ids': ids,

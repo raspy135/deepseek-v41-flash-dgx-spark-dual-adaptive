@@ -36,8 +36,12 @@ class FakeRuntime:
         return event
 
 
-def make_scheduler():
+def make_scheduler(n=None, capacity=None):
     runtime = FakeRuntime()
+    if n is not None:
+        runtime.n = n
+    if capacity is not None:
+        runtime.capacity = capacity
     state = SimpleNamespace(lock=threading.Lock(), ep_fault=None,
                             ep=SimpleNamespace(broadcast_request=lambda x: None,
                                                gather_objects=lambda x: [x, x]),
@@ -103,16 +107,104 @@ class TestScheduler(unittest.TestCase):
         self.assertIn({'op': 'close', 'lane': 0}, runtime.actions)
         self.assertIsNone(state.ep_fault)
 
-    def test_scheduled_peer_control_accepts_the_step_gate_args(self):
-        """engine/dist.py:control grew (value, flag) for the depth and adaptation broadcast; the
-        lane's stub must keep up or the first concurrent request dies with "takes 2 positional
-        arguments but 4 were given" and marks the pair out of step."""
+    def test_scheduled_peer_control_carries_rank_zero_decisions(self):
+        """A lane's step gate must be the real broadcast: rank 1 decides nothing itself (its
+        depth is a placeholder 0), so keeping its own value made it verify a root-only block
+        against rank 0's full one. Here rank 1 passes 0 and must read back rank 0's 3 and 2."""
         from engine.serving import ScheduledPeer
-        peer = ScheduledPeer(SimpleNamespace(rank=0, active=True))
-        self.assertTrue(peer.control(True, 5, 1))
-        self.assertEqual((peer.control_value, peer.control_flag), (5, 1))
-        self.assertFalse(peer.control(False))
-        self.assertEqual(peer.rank, 0)          # __getattr__ still reaches the wrapped peer
+        sent = []
+
+        class Peer:
+            rank, active = 1, True
+
+            def control(self, keep_going, value=0, flag=0):
+                sent.append((keep_going, value, flag))
+                self.control_value, self.control_flag = 3, 2   # what rank 0 broadcast
+                return True
+
+        peer = ScheduledPeer(Peer())
+        self.assertTrue(peer.control(True, 0, 0))
+        self.assertEqual((peer.control_value, peer.control_flag), (3, 2))
+        self.assertEqual(sent, [(True, 0, 0)])
+        self.assertEqual(peer.rank, 1)          # __getattr__ still reaches the wrapped peer
+        peer.release_peer()                     # termination stays a scheduler action
+        self.assertEqual(len(sent), 1)
+
+    def test_four_lanes_verify_together(self):
+        scheduler, state, runtime = make_scheduler(n=4)
+        jobs = [scheduler.submit({'prompt_ids': [10 * i], 'kwargs': {}}) for i in (1, 2, 3, 4)]
+        state.lock.release()
+        for i, job in enumerate(jobs, 1):
+            self.assertTrue(job.finished.wait(2))
+            self.assertEqual(list(job), [[10 * i], [10 * i + 1]])
+        # Prefill is sequential (one start per lane), verification is one batched action.
+        starts = [a['lane'] for a in runtime.actions if a['op'] == 'start']
+        self.assertEqual(starts, [0, 1, 2, 3])
+        self.assertIn({'op': 'verify', 'lanes': [0, 1, 2, 3]}, runtime.actions)
+        self.assertEqual(sum(a['op'] == 'verify' for a in runtime.actions), 1)
+
+    def test_long_request_takes_lane_zero_without_blocking_short_ones(self):
+        # Lane 0 holds 1000 positions, the short lanes 100. need = prompt + max_tokens + 8.
+        scheduler, state, runtime = make_scheduler(n=3, capacity=[1000, 100, 100])
+        hold = scheduler.submit({'prompt_ids': [1], 'kwargs': {'max_tokens': 500}})
+        long2 = scheduler.submit({'prompt_ids': [2], 'kwargs': {'max_tokens': 500}})
+        short = scheduler.submit({'prompt_ids': [3], 'kwargs': {'max_tokens': 50}})
+        state.lock.release()
+        for job in (hold, long2, short):
+            self.assertTrue(job.finished.wait(2))
+        self.assertEqual((hold.lane, long2.lane, short.lane), (0, 0, 1))
+        starts = [(a['lane'], a['prompt_ids'][0]) for a in runtime.actions if a['op'] == 'start']
+        # The short request is admitted while the second long one still waits for lane 0.
+        self.assertLess(starts.index((1, 3)), starts.index((0, 2)))
+        self.assertIsNone(state.ep_fault)
+
+    def test_short_request_prefers_a_short_lane(self):
+        scheduler, state, runtime = make_scheduler(n=3, capacity=[1000, 100, 100])
+        job = scheduler.submit({'prompt_ids': [3], 'kwargs': {'max_tokens': 50}})
+        state.lock.release()
+        self.assertTrue(job.finished.wait(2))
+        self.assertEqual(job.lane, 1)
+
+    def test_returning_conversation_goes_back_to_its_lane(self):
+        scheduler, state, runtime = make_scheduler(n=3, capacity=[1000, 100, 100])
+        runtime.engines = [SimpleNamespace(_prefix_cache=None, _prefix_snapshots={}),
+                           SimpleNamespace(_prefix_cache=None, _prefix_snapshots={}),
+                           SimpleNamespace(_prefix_cache={'ids': (7, 8, 9)}, _prefix_snapshots={})]
+        job = scheduler.submit({'prompt_ids': [7, 8, 9, 10], 'kwargs': {'max_tokens': 20}})
+        other = scheduler.submit({'prompt_ids': [1, 2], 'kwargs': {'max_tokens': 20}})
+        state.lock.release()
+        self.assertTrue(job.finished.wait(2) and other.finished.wait(2))
+        self.assertEqual(job.lane, 2)       # its prefix lives on lane 2, not the default lane 1
+        self.assertEqual(other.lane, 1)
+
+    def test_request_larger_than_every_lane_fails_before_dispatch(self):
+        scheduler, state, runtime = make_scheduler(n=2, capacity=[100, 50])
+        job = scheduler.submit({'prompt_ids': [1], 'kwargs': {'max_tokens': 200}})
+        state.lock.release()
+        self.assertTrue(job.finished.wait(2))
+        with self.assertRaisesRegex(ValueError, 'every lane'):
+            next(job)
+        self.assertEqual(runtime.actions, [])
+        self.assertIsNone(state.ep_fault)
+
+    def test_lane_capacities(self):
+        from unittest.mock import patch
+        from engine.serving import lane_capacities, concurrency
+        with patch.dict('os.environ', {}, clear=False) as env:
+            env.pop('DSV41_LANE_MAX_SEQ', None)
+            self.assertEqual(lane_capacities(524288, 1), [524288])
+            self.assertEqual(lane_capacities(524288, 3), [524288, 65536, 65536])
+            self.assertEqual(lane_capacities(32768, 2), [32768, 32768])
+            env['DSV41_LANE_MAX_SEQ'] = '16384'
+            self.assertEqual(lane_capacities(524288, 2), [524288, 16384])
+            env['DSV41_LANE_MAX_SEQ'] = '100'
+            with self.assertRaises(ValueError):
+                lane_capacities(524288, 2)
+            env['DSV41_MAX_CONCURRENCY'] = '9'
+            with self.assertRaises(ValueError):
+                concurrency()
+            env['DSV41_MAX_CONCURRENCY'] = '4'
+            self.assertEqual(concurrency(), 4)
 
     def test_stream_eof_is_stable(self):
         job = RequestStream({})

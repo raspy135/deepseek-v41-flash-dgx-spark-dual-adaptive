@@ -421,7 +421,7 @@ Constraints if you change it:
 4. **`context_margin` is a fixed 8** (`server/app.py:626`); a block wider than 8 can overrun
    the configured context at the tail unless the margin is raised too.
 5. Every static buffer in `FastDecoder` is sized `T = T_VERIFY`, so changing it forces a
-   graph recapture; `Model.dspark_draft` reads `T_DRAFT`, and `engine/batch2.py` splits by
+   graph recapture; `Model.dspark_draft` reads `T_DRAFT`, and `engine/batch_decode.py` splits by
    `T_VERIFY`.
 
 ---

@@ -2499,3 +2499,91 @@ fresh database. Untested: raw score restricted to the kept picks (`score_kept`),
 effects. The residency cost itself dwarfs every metric difference on general text (+0.234 for the
 best set vs +0.006 on code): 26K tokens of mostly English/code training demand leave whole topics
 unranked, which is the gap serving's adaptation exists to close.
+
+## Concurrent lanes shared one verify-block buffer: `copy.copy` shares `_vbufs` (2026-10-14)
+
+`make_engine_lane` gives each lane a `copy.copy` of the engine and then replaces the per-request
+state. It replaced `_blk`/`_vout`/`_vhost`, but the decode loop reads `self._vbufs[width]`, a dict
+of those triples per verify width that the shallow copy shares. The lean greedy path builds the
+verify block in place in that buffer and yields it, so every lane's `VerifyStep.block` is the same
+tensor: the last lane to draft overwrites the others' blocks before the batched step reads them.
+Found by reading and fixed before the batched runtime first ran, so its effect was not observed;
+nothing would raise. Each lane now gets its own `_vbufs`. Any new per-request buffer on the engine
+has to be added to `engine/serving.py:make_engine_lane`, or every lane shares it.
+
+The opposite case: state an expert swap *reassigns* lands only on the engine view that ran the
+swap. A swap inside a lane's prefill set that lane's `_swap_baseline`, and the primary engine's
+between-requests pass kept its stale one and re-planned early. Such attributes are carried between
+the primary and the active lane in `engine/serving.py:_SWAP_STATE`.
+
+## Wide decode tiles: BLOCK_K 256 at 64 rows does not fit shared memory (2026-10-14)
+
+Batched decode (`engine/batch_decode.py`) runs the FP8 decode kernel at 32/64-row tiles. With the
+live `DSV41_FP8_DECODE_BLOCK_K=256`, a 64-row tile stages ~40 KB a pipeline stage, 115 KB over
+three, against GB10's 99 KB: the launch fails with `OutOfResources`. Wide tiles drop to K 128 when a
+stage would pass 32 KB (`fp8_linear._wide_block_k`). That is bit-identical, because each output
+still accumulates over K in the same order: `tools/test_decode_rows.py` compares every row of a
+24-60 row call against 6-row calls on the 16-row tile at K 256, under BLOCK_N 32/auto and K
+128/256. The 16-row tile never changes.
+
+## Concurrent lanes: rank 1 verified a root-only block (2026-10-14)
+
+`_decode_step_value` returns a placeholder 0 on rank 1 and relies on `EPDistributed.control` to
+broadcast rank 0's choice. A concurrent lane's `ScheduledPeer.control` has no broadcast -- the
+scheduler owns termination -- and kept each rank's own value, so rank 1 took mode 0 ("root-only",
+a 2-row verify) while rank 0 verified the full block. With fixed depth there is no 2-row buffer
+and rank 1 died with `KeyError: 2` on its first decode step; had the width existed, the two ranks
+would have replayed different graphs. A lane's `control` is now the real broadcast: both ranks
+reach it inside the same scheduler action, so it pairs up, and it carries rank 0's dynamic depth
+and decode-adaptation flag to rank 1. (A first fix had each rank compute the fixed depth itself;
+it could not carry a depth the policy chose, and was replaced.)
+
+Related: `copy.copy(engine)` also shared the `DepthPolicy` object between lanes, so a new
+request's `reset_request()` reset the depth of the requests already running and every lane trained
+one set of step-cost and acceptance statistics. Each lane now deep-copies its policies.
+
+## Raising `DSV41_ROCE_MAX_KB` to carry batched gathers made every graph slower (2026-10-14)
+
+Batched decode's first MoE all-gather is (pairs + rows) x 1152 bf16 a rank: 387 KB at four lanes,
+past the 256 KiB RoCE slot, so it falls back to NCCL inside the graph. Raising the slot to 1024 KiB
+to keep it on RoCE was measured with `tools/bench_batch_decode_tp.py` (TP2, keep 0.57, same build,
+two consecutive runs, one arm each): the four-lane batched step went 199.4 -> 253.2 ms, and graphs with no collective
+at all slowed too (attention core 25.1 -> 32.4 ms, per-lane HC/router 18.3 -> 22.1 ms). The MoE
+graph itself did not get faster (125.5 -> 126.9). Keep 256; the NCCL fallback for that one gather
+is not where the time goes.
+
+## Concurrency's memory came out of the steady-state margin (2026-10-14)
+
+A two-lane session on the 512K / 98.4 GB profile took rank 1 to the memory watchdog after ~17
+minutes: two clients, then one client with a growing conversation. Two causes. The arena check
+at boot (`cap = MemAvailable - KEEP_FREE_GB`) only bites when the requested arena exceeds what is
+available at load, and a hand-tuned `ARENA_GB` does not -- it is tuned so one request *settles*
+with a few GB free -- so the lanes, built afterwards, came straight out of that margin. And no
+graph was ever released: the batched graphs, each lane's attention-core pool (growing with the
+context bucket) and lane 1's own single-request graphs all stayed after their last use. Rank 1 is
+the tight node: at concurrency 1 the same session bottoms out at 3.46 GiB there, ~1 GB above the
+2.5 GB floor. Fix and measurements: docs/concurrency.md, "Memory". A first version of the fix only
+subtracted the reserve from the cap, which this profile never reaches; it would not have helped.
+
+## Batched rounds trained the depth policy (2026-10-14)
+
+With dynamic depth, a request alone on the concurrent runtime ran 15-18% slower than on the
+single-request path (42.8-43.4 against 49.0-52.0 tok/s, same prompt); at fixed depth the two were
+within 1.5%. The policy times each step from the top of the loop to its accept, and on the runtime
+that includes the batched round the lane waited in -- a round's wall time, set by every lane in it,
+so depth 3 and depth 5 read alike and both read ~3x slow. The gate log shows it: lanes in a batched
+round compared a batched-timed depth 3 (11-17 tok/s) with a solo-timed depth 5 (32-56) and all went
+to 5; the lone request afterwards estimated depth 3 at 17.0 tok/s while running at ~50. A depth the
+policy stops choosing keeps its stale time indefinitely. Fix: `_policy_step_s` returns None for a
+step verified in a batched round. Capping batched rounds at depth 3 as well was measured and
+rejected: it cost a code pair ~20% of its tokens a step (docs/concurrency.md).
+
+## Releasing a lane's graphs at every request end (2026-10-14)
+
+The first memory fix for concurrency released a lane's attention-core graphs when its request
+ended and the batched graphs after 128 solo steps. Memory-safe, but every concurrent pair then
+recaptured: 1.1-1.4 s a pair on the serving trace, ~8% of a pair of 200-token answers, and part of
+why two streams together came out 14-16% *below* one after another there. The bound that matters
+is per bucket, not per request: a lane now keeps one context bucket of core graphs and drops it
+only when it captures another (`BatchDecoder._drop_stale_core`).
+

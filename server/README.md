@@ -1,8 +1,11 @@
 # server/ -- OpenAI-compatible HTTP layer
 
 Standard-library-only (`http.server` + `json`) front end for the DeepSeek-V4.1-Flash engine.
-Requests are served **one at a time** (the engine is single-sequence); concurrent requests wait
-on a lock, nothing is rejected.
+Requests are served **one at a time** by default (the engine is single-sequence); concurrent
+requests wait on a lock, nothing is rejected. With `DSV41_MAX_CONCURRENCY=N` (TP2 only) a queue
+feeds N lanes: prefill is sequential and the decoding lanes' verify steps run batched
+(`server/concurrency.py`, `engine/serving.py`, `engine/batch_decode.py`, docs/concurrency.md).
+Up to 32 requests wait; past that the server answers 503 `server_busy`.
 
 ```bash
 python3 server/app.py --model-dir ./models/DeepSeek-V4.1-Flash --engine mock      # HTTP layer only
