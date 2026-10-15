@@ -142,6 +142,44 @@ class PrefixDisk:
         finally:
             Path(temporary).unlink(missing_ok=True)
 
+    def serving(self, hashes, route=None):
+        """For each ``(n, token hash)``, the bundles that could serve it, most recently used first.
+
+        Only bundles whose file is present at its indexed size count: the index alone must not
+        make a future restore a silent miss when a fresh write would have worked. Nothing is
+        touched here. On the pair a skip needs the same bundle on BOTH ranks (restore uses
+        only bundle ids common to every rank), so the caller compares this across ranks and
+        then calls ``touch`` with the bundles it agreed on.
+        """
+        route_sql = '' if route is None else ' AND p.route=?'
+        result, live = {}, {}
+        with self._db() as db:
+            for n, digest in hashes.items():
+                params = [self.namespace, n, digest]
+                if route is not None:
+                    params.append(route)
+                rows = db.execute(
+                    'SELECT p.bundle, b.size FROM prefixes p JOIN bundles b ON b.id=p.bundle '
+                    'WHERE b.namespace=? AND p.n=? AND p.hash=?' + route_sql +
+                    ' ORDER BY b.used DESC', params).fetchall()
+                bids = []
+                for bid, size in rows:
+                    if bid not in live:
+                        try:
+                            live[bid] = (self.root / (bid + '.pt')).stat().st_size == size
+                        except OSError:
+                            live[bid] = False
+                    if live[bid] and bid not in bids:
+                        bids.append(bid)
+                result[n] = bids
+        return result
+
+    def touch(self, bundle_ids):
+        """Mark bundles used now, so LRU keeps the ones a skipped save relies on."""
+        with self._db() as db:
+            db.executemany('UPDATE bundles SET used=? WHERE id=?',
+                           [(time.time(), bid) for bid in dict.fromkeys(bundle_ids)])
+
     def candidates(self, tokens, route=None, media=()):
         with self._db() as db:
             rows = db.execute('''SELECT p.bundle, p.n, p.hash, p.route FROM prefixes p

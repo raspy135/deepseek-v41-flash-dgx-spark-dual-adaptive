@@ -29,7 +29,7 @@ from engine import fastdecode as _FD  # noqa: E402  (format flags pinned in the 
 from engine import draft_vocab as _DRAFT_VOCAB  # noqa: E402  (listed draft ids, boot guard)
 from engine import expert_topp as _ETP  # noqa: E402  (lossy decode pruning, boot guard)
 from engine.prefix_media import image_fingerprints, media_prefix
-from engine.prefix_persistence import PREFIX_DISK_MIN_INTERVAL_S
+from engine.prefix_persistence import PREFIX_DISK_DEDUP, PREFIX_DISK_MIN_INTERVAL_S
 import v41_ref as R  # noqa: E402
 
 
@@ -1541,8 +1541,9 @@ class V41Engine:
                 "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1'),
                 "prefix_cache": os.environ.get('DSV41_PREFIX_CACHE', '1'),
                 "prefix_disk": PREFIX_DISK,
-                "prefix_disk_version": 3,  # rank-0-authoritative save interval
+                "prefix_disk_version": 4,  # rank-0-authoritative save interval and duplicate skip
                 "prefix_disk_min_interval_s": PREFIX_DISK_MIN_INTERVAL_S,
+                "prefix_disk_dedup": PREFIX_DISK_DEDUP,
                 "prefix_disk_strict": os.environ.get("DSV41_PREFIX_DISK_STRICT", "0"),
             }
             peer_cfg = self.ep.broadcast_obj(cfg)
@@ -3671,6 +3672,7 @@ class V41Engine:
             "prefix_disk": self.prefix_disk is not None,
             "prefix_disk_configured": PREFIX_DISK,
             "prefix_disk_min_interval_s": PREFIX_DISK_MIN_INTERVAL_S,
+            "prefix_disk_dedup": PREFIX_DISK_DEDUP,
             "prefix_disk_last": self.prefix_disk.stats if self.prefix_disk is not None else None,
             "prefill_replica_slots": self.replica_slots,
             "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),

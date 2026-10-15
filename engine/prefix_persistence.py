@@ -14,12 +14,18 @@ import uuid
 
 import torch
 
-from engine.prefix_disk import PrefixDisk, cpu_tree, device_tree
+from engine.prefix_disk import PrefixDisk, cpu_tree, device_tree, token_hashes
 from engine.prefix_media import media_prefix
 
 PREFIX_DISK_MIN_INTERVAL_S = float(os.environ.get('DSV41_PREFIX_DISK_MIN_INTERVAL_S', '300'))
 if not math.isfinite(PREFIX_DISK_MIN_INTERVAL_S) or PREFIX_DISK_MIN_INTERVAL_S < 0:
     raise ValueError('DSV41_PREFIX_DISK_MIN_INTERVAL_S must be finite and nonnegative')
+
+# Before staging, ask the local index whether every boundary a save would write is
+# already published. A conversation re-sent after a restart, or a save that comes due
+# with no new tokens, then costs a hash-and-index lookup instead of seconds of CPU copy
+# and a full KV rewrite. Skipped only when every rank holds the same bundle (_duplicate).
+PREFIX_DISK_DEDUP = os.environ.get('DSV41_PREFIX_DISK_DEDUP', '1') == '1'
 
 
 def namespace(engine):
@@ -81,6 +87,7 @@ class PersistentPrefixes:
         self.pending = None
         self.stats = {}
         self.min_interval_s = PREFIX_DISK_MIN_INTERVAL_S
+        self.dedup = PREFIX_DISK_DEDUP
         self._last_save_attempt = None
 
     def join(self):
@@ -91,6 +98,50 @@ class PersistentPrefixes:
             except Exception as exc:
                 self.log(f'prefix disk write failed ({type(exc).__name__}); keeping RAM cache')
             self.pending = None
+
+    def _save_snapshots(self, prompt):
+        """Boundary snapshots that still describe this exact prompt, and the media tuple."""
+        e = self.engine
+        media = getattr(e, '_prefix_media', ())
+        snapshots = dict(e._prefix_snapshots)
+        snapshots[len(prompt)] = e._prefix_cache
+        return {n: s for n, s in snapshots.items() if s is not None
+                and n <= len(prompt) and tuple(prompt[:n]) == s['ids']
+                and tuple(s.get('media', ())) == media_prefix(media, n)}, media
+
+    def _duplicate(self, prompt):
+        """(skip, prepared): skip when every boundary of this save is already served by a bundle
+        present on EVERY rank. Restore uses only bundle ids common to all ranks, so rank 0's
+        disk alone is not enough: a bundle rank 1 failed to write or has since evicted would
+        otherwise be skipped forever, and every restart would miss. Hashing needs only token
+        ids and media, so this runs before any tensor copy. Every rank reaches the gather,
+        including one whose local lookup failed (it reports None, which forces a write)."""
+        e = self.engine
+        prepared, local = None, None
+        try:
+            prepared = self._save_snapshots(prompt)
+            snapshots, media = prepared
+            if snapshots:
+                local = self.disk.serving(token_hashes(tuple(prompt), snapshots, media),
+                                          e._prefix_route if self.strict else None)
+        except Exception as exc:
+            self.log(f'prefix disk duplicate check failed ({type(exc).__name__}); saving')
+        ranks = e.ep.gather_objects(local)
+        if not ranks or any(not r for r in ranks):
+            return False, prepared
+        # Every rank computes the same choice from the same gathered lists (rank 0's order),
+        # so both touch the same bundles and their LRU orders stay in step.
+        chosen = []
+        for n, bids in ranks[0].items():
+            common = [b for b in bids if all(b in r.get(n, ()) for r in ranks[1:])]
+            if not common:
+                return False, prepared
+            chosen.append(common[0])
+        try:
+            self.disk.touch(chosen)
+        except Exception as exc:
+            self.log(f'prefix disk touch failed ({type(exc).__name__})')
+        return True, prepared
 
     def save(self, prompt):
         e = self.engine
@@ -106,20 +157,27 @@ class PersistentPrefixes:
         bid = e.ep.broadcast_obj(bid)
         if bid is None:
             return
+        # Both ranks got the same bid and run the same boot-guarded dedup flag, so the
+        # gather inside _duplicate is reached on both or on neither.
+        prepared = None
+        if self.dedup:
+            duplicate, prepared = self._duplicate(prompt)
+            if duplicate:
+                # Not a write, so do not consume the interval: the next turn with a longer
+                # prompt must be allowed to persist its new suffix immediately.
+                self.stats = {'source': 'disk-duplicate', 'tokens': len(prompt)}
+                self.log('prefix disk save skipped: identical boundaries already on disk')
+                return
         # Bound failed attempts too, rather than retrying expensive staging every turn.
         self._last_save_attempt = now
         self.join()
         start = time.perf_counter()
         try:
-            snapshots = dict(e._prefix_snapshots)
-            snapshots[len(prompt)] = e._prefix_cache
-            snapshots = {n: s for n, s in snapshots.items() if s is not None
-                         and n <= len(prompt) and tuple(prompt[:n]) == s['ids']
-                         and tuple(s.get('media', ())) == media_prefix(getattr(e, '_prefix_media', ()), n)}
+            snapshots, media = prepared if prepared is not None else self._save_snapshots(prompt)
             c = e.caches
             payload = cpu_tree({
                 'ids': tuple(prompt), 'snapshots': snapshots,
-                'media': getattr(e, '_prefix_media', ()),
+                'media': media,
                 'ckv': {L: value[:len(prompt) // e.args.compress_ratios[L]]
                         for L, value in c.ckv.items()},
                 'ik': {L: value[:len(prompt) // e.args.compress_ratios[L]]

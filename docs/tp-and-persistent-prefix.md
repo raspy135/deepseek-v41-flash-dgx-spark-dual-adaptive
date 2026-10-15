@@ -41,6 +41,38 @@ ranks skip different collectives. Failed attempts also consume the interval. The
 background timer or shutdown flush: persistence catches up at the next eligible boundary
 after the interval, so a restart may require recomputing the unsaved suffix.
 
+Once rank 0 has broadcast that a save is due, and before anything is staged, both ranks hash
+the boundary token ids and list the bundles in their local index that serve each boundary.
+The lists are gathered, and the save is a duplicate only if every boundary is served by a
+bundle id present on **every** rank. Then staging and the file write are skipped, both ranks
+touch the same agreed bundles so their LRU orders stay in step, and the interval is **not**
+consumed, because nothing was written and the next new suffix should persist immediately. A
+row whose blob is missing or the wrong length does not count, so skipping cannot turn a
+missing file into a silent restore miss.
+
+Rank 0's index alone is not enough, and the first version of this check made that mistake.
+Restore uses only bundle ids common to all ranks. A bundle that rank 1 failed to write, or
+evicted because only rank 0's copy was being touched, would have been skipped on every later
+save, and every restart would have missed disk with nothing in the log. Before the dedup
+check, the next due save simply wrote a fresh bundle on both ranks. A rank whose lookup
+fails reports nothing, which forces the write. This is
+what makes a restart resumable without rewriting the prompt it just restored: an agent loop
+that re-sends the same prompt after the interval elapses no longer stages the same KV again.
+The check is bounded by the boundary count, not the context, but it still runs only when a
+save is due.
+
+Negative result / limitation: the skip is all-or-nothing. A conversation that *grows* adds a
+new boundary, so its bundle is not a duplicate and the whole prompt KV is rewritten, even
+though every earlier boundary is already resident. Making that incremental needs a delta or
+segment bundle format and parent-aware eviction; the index/format here is not that. The
+duplicate skip helps repeated identical turns (retries, tool loops, benchmark repeats), not
+unbounded context growth.
+
+The compatibility hash ignores `DSV41_PREFIX_DISK_DEDUP` (like the other `DSV41_PREFIX_*`
+switches), so toggling it does not need to invalidate existing bundles; the boot guard
+requires both ranks to run the same setting, since the check adds a collective. `DSV41_PREFIX_DISK_DEDUP=0` restores the previous behavior
+for a matched A/B measurement.
+
 Motivation: the 2026-10-02 live tool workload at roughly 150K context logged 5.35–5.97 seconds
 of synchronous staging per save, with roughly 668–675 MB bundles. Total prefill on nearby
 turns was 9–10 seconds despite over 99% RAM prefix hits. The file write itself is asynchronous;

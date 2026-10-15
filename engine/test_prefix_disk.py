@@ -110,10 +110,25 @@ class PrefixDiskTests(unittest.TestCase):
         self.disk.budget = 10
         self.assertFalse(self.disk.save(uuid.uuid4().hex, payload())['saved'])
 
+    def test_serving_lists_only_live_matching_blobs(self):
+        from engine.prefix_disk import token_hashes
+        bid = self.save()
+        value = payload()
+        hashes = token_hashes(value['ids'], value['snapshots'])
+        self.assertEqual(self.disk.serving({2: hashes[2], 4: hashes[4]}), {2: [bid], 4: [bid]})
+        self.assertEqual(self.disk.serving({2: hashes[2], 5: 'missing'}), {2: [bid], 5: []})
+        self.assertEqual(PrefixDisk(self.tmp.name, 'model-b', 1000000).serving({2: hashes[2]}),
+                         {2: []})
+        self.assertEqual(self.disk.serving({2: hashes[2]}, route='route-b'), {2: []})
+        # The index row alone is not coverage: the blob file is what serves a restore.
+        (Path(self.tmp.name) / (bid + '.pt')).unlink()
+        self.assertEqual(self.disk.serving({2: hashes[2]}), {2: []})
+
     def adapter(self, peer_options=None, peer_load_ok=True):
         from engine.v41_engine import V41Engine
         p = object.__new__(PersistentPrefixes)
         p.disk, p.strict, p.pending, p.stats, p.log = self.disk, False, None, {}, lambda _: None
+        p.dedup = False
         e = object.__new__(V41Engine)
         e.args = SimpleNamespace(compress_ratios={0: 2}, window_size=4,
                                  candidate_source_layer=0, head_dim=2, hc_mult=2, dim=3)
@@ -167,8 +182,8 @@ class PrefixDiskTests(unittest.TestCase):
         self.assertEqual(p.restore([1, 2, 3, 4], 0), 0)
         self.assertEqual(p.engine.caches.ckv[0].count_nonzero(), 0)
 
-    def saving_adapter(self, rank=0):
-        p = self.adapter()
+    def saving_adapter(self, rank=0, dedup=False, peer_options=None):
+        p = self.adapter(peer_options=peer_options)
         value = payload()
         p.engine._prefix_cache = value['snapshots'][6]
         p.engine._prefix_snapshots = dict(value['snapshots'])
@@ -177,6 +192,7 @@ class PrefixDiskTests(unittest.TestCase):
         p.engine.ep.rank = rank
         p.engine.ep.broadcast_obj = Mock(side_effect=lambda value: value)
         p.min_interval_s, p._last_save_attempt = 300, None
+        p.dedup = dedup
         from concurrent.futures import ThreadPoolExecutor
         p.pool = ThreadPoolExecutor(max_workers=1)
         self.addCleanup(p.pool.shutdown)
@@ -237,6 +253,110 @@ class PrefixDiskTests(unittest.TestCase):
             p.save(list(payload()['ids']))
             self.assertEqual(copy.call_count, 1)
         self.assertIsNone(p.pending)
+
+    def test_duplicate_boundaries_skip_staging_and_write(self):
+        p = self.saving_adapter(dedup=True)
+        ids = list(payload()['ids'])
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100):
+            p.save(ids)
+        p.join()
+        original = self.disk.candidates(ids)
+        self.assertEqual(len(original), 3)
+        # A restart resets the interval; the same boundaries are already published.
+        p._last_save_attempt = None
+        with patch('engine.prefix_persistence.time.monotonic', return_value=1000), \
+                patch('engine.prefix_persistence.cpu_tree') as copy:
+            p.save(ids)
+            copy.assert_not_called()
+        self.assertIsNone(p.pending)
+        self.assertEqual(self.disk.candidates(ids), original)
+        # A skip is not a write, so the next new suffix may still be persisted at once.
+        self.assertIsNone(p._last_save_attempt)
+        self.assertEqual(p.stats['source'], 'disk-duplicate')
+
+    def test_new_boundary_still_writes_after_a_duplicate_skip(self):
+        p = self.saving_adapter(dedup=True)
+        ids = list(payload()['ids'])
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100):
+            p.save(ids)
+        p.join()
+        # Now the prompt grows by two tokens: boundary 8 has no stored hash, so this must
+        # reach disk even though boundaries 2/4/6 are already there.
+        grown = ids + [7, 8]
+        snap8 = dict(payload()['snapshots'][6])
+        snap8['ids'] = tuple(grown)
+        p.engine._prefix_cache = snap8
+        p.engine._prefix_snapshots = {6: payload()['snapshots'][6]}
+        p.engine.caches.ckv = {0: torch.zeros(4, 2, dtype=torch.bfloat16)}
+        p.engine.caches.ik = {0: torch.zeros(4, 1, dtype=torch.bfloat16)}
+        p._last_save_attempt = None
+        with patch('engine.prefix_persistence.time.monotonic', return_value=101):
+            p.save(grown)
+        p.join()
+        self.assertTrue(any(n == 8 for _, n in self.disk.candidates(grown)))
+
+    def first_save_then_restart(self, **kwargs):
+        p = self.saving_adapter(dedup=True, **kwargs)
+        ids = list(payload()['ids'])
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100):
+            p.save(ids)
+        p.join()
+        p._last_save_attempt = None
+        return p, ids
+
+    def test_duplicate_needs_the_same_bundle_on_every_rank(self):
+        # Rank 1 never wrote (or has evicted) the bundle rank 0 holds. Restore only uses
+        # bundle ids common to both ranks, so skipping would make every restart miss.
+        p, ids = self.first_save_then_restart(peer_options={2: [], 4: [], 6: []})
+        before = len(self.disk.candidates(ids))
+        with patch('engine.prefix_persistence.time.monotonic', return_value=1000):
+            p.save(ids)
+        p.join()
+        self.assertEqual(len(self.disk.candidates(ids)), 2 * before)
+        self.assertEqual(p._last_save_attempt, 1000)
+
+    def test_duplicate_with_a_different_bundle_on_the_peer_still_writes(self):
+        p, ids = self.first_save_then_restart(
+            peer_options={n: [uuid.uuid4().hex] for n in (2, 4, 6)})
+        before = len(self.disk.candidates(ids))
+        with patch('engine.prefix_persistence.time.monotonic', return_value=1000):
+            p.save(ids)
+        p.join()
+        self.assertEqual(len(self.disk.candidates(ids)), 2 * before)
+
+    def test_failed_peer_lookup_forces_a_write(self):
+        p, ids = self.first_save_then_restart()
+        def gather(x):
+            return [x, None]
+        p.engine.ep.gather_objects = gather
+        before = len(self.disk.candidates(ids))
+        with patch('engine.prefix_persistence.time.monotonic', return_value=1000):
+            p.save(ids)
+        p.join()
+        self.assertEqual(len(self.disk.candidates(ids)), 2 * before)
+
+    def test_duplicate_touches_the_agreed_bundle_on_this_rank(self):
+        p, ids = self.first_save_then_restart()
+        (bid, _), = {(b, n) for b, n in self.disk.candidates(ids) if n == 6}
+        with self.disk._db() as db:
+            db.execute('UPDATE bundles SET used=0 WHERE id=?', (bid,))
+        with patch('engine.prefix_persistence.time.monotonic', return_value=1000):
+            p.save(ids)
+        self.assertEqual(p.stats['source'], 'disk-duplicate')
+        with self.disk._db() as db:
+            used, = db.execute('SELECT used FROM bundles WHERE id=?', (bid,)).fetchone()
+        self.assertGreater(used, 0)
+
+    def test_duplicate_check_disabled_saves_every_due_boundary(self):
+        p = self.saving_adapter(dedup=False)
+        ids = list(payload()['ids'])
+        with patch('engine.prefix_persistence.time.monotonic', return_value=100):
+            p.save(ids)
+            p.join()
+            p._last_save_attempt = None
+            p.save(ids)
+            p.join()
+        self.assertEqual(len(self.disk.candidates(ids)), 6)
 
 
 if __name__ == '__main__':
